@@ -10,7 +10,6 @@ import {
 	sendMentionNotification,
 	sendLikeNotification,
 	sendFollowNotification,
-	sendReblogNotification,
 	createNotification,
 	insertFollowNotification,
 } from 'wildebeest/backend/src/mastodon/notification'
@@ -21,7 +20,7 @@ import { addFollowing, acceptFollowing } from 'wildebeest/backend/src/mastodon/f
 import { deliverToActor } from 'wildebeest/backend/src/activitypub/deliver'
 import { getSigningKey } from 'wildebeest/backend/src/mastodon/account'
 import { insertLike } from 'wildebeest/backend/src/mastodon/like'
-import { insertReblog } from 'wildebeest/backend/src/mastodon/reblog'
+import { createReblog } from 'wildebeest/backend/src/mastodon/reblog'
 import { insertReply } from 'wildebeest/backend/src/mastodon/reply'
 import type { Activity } from 'wildebeest/backend/src/activitypub/activities'
 
@@ -287,16 +286,12 @@ export async function handle(
 
 			const notifId = await createNotification(db, 'reblog', targetActor, fromActor, obj)
 
-			await Promise.all([
-				// Add the object in the originating actor's outbox, allowing other
-				// actors on this instance to see the note in their timelines.
-				addObjectInOutbox(db, fromActor, obj, activity.published),
-
-				// Store the reblog for counting
-				insertReblog(db, fromActor, obj),
-
-				sendReblogNotification(db, fromActor, targetActor, notifId, adminEmail, vapidKeys),
-			])
+			await createReblog(db, fromActor, obj, {
+				target: targetActor,
+				notifId,
+				adminEmail,
+				vapidKeys,
+			})
 			break
 		}
 
