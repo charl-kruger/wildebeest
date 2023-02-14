@@ -10,20 +10,22 @@ import {
 	sendMentionNotification,
 	sendLikeNotification,
 	sendFollowNotification,
-	sendReblogNotification,
 	createNotification,
 	insertFollowNotification,
+	sendReblogNotification,
 } from 'wildebeest/backend/src/mastodon/notification'
-import { type Object, updateObject } from 'wildebeest/backend/src/activitypub/objects'
+import { type APObject, updateObject } from 'wildebeest/backend/src/activitypub/objects'
 import { parseHandle } from 'wildebeest/backend/src/utils/parse'
 import type { Note } from 'wildebeest/backend/src/activitypub/objects/note'
 import { addFollowing, acceptFollowing } from 'wildebeest/backend/src/mastodon/follow'
 import { deliverToActor } from 'wildebeest/backend/src/activitypub/deliver'
 import { getSigningKey } from 'wildebeest/backend/src/mastodon/account'
 import { insertLike } from 'wildebeest/backend/src/mastodon/like'
-import { insertReblog } from 'wildebeest/backend/src/mastodon/reblog'
+import { createReblog } from 'wildebeest/backend/src/mastodon/reblog'
 import { insertReply } from 'wildebeest/backend/src/mastodon/reply'
 import type { Activity } from 'wildebeest/backend/src/activitypub/activities'
+import { originalActorIdSymbol, deleteObject } from 'wildebeest/backend/src/activitypub/objects'
+import { hasReblog } from 'wildebeest/backend/src/mastodon/reblog'
 
 function extractID(domain: string, s: string | URL): string {
 	return s.toString().replace(`https://${domain}/ap/users/`, '')
@@ -100,12 +102,16 @@ export async function handle(
 	const getObjectAsId = makeGetObjectAsId(activity)
 	const getActorAsId = makeGetActorAsId(activity)
 
-	console.log(activity)
 	switch (activity.type) {
 		case 'Update': {
 			requireComplexObject()
 			const actorId = getActorAsId()
 			const objectId = getObjectAsId()
+
+			if (!['Note', 'Person', 'Service'].includes(activity.object.type)) {
+				console.warn('unsupported Update for Object type: ' + activity.object.type)
+				return
+			}
 
 			// check current object
 			const object = await objects.getObjectBy(db, 'original_object_id', objectId.toString())
@@ -113,7 +119,7 @@ export async function handle(
 				throw new Error(`object ${objectId} does not exist`)
 			}
 
-			if (actorId.toString() !== object.originalActorId) {
+			if (actorId.toString() !== object[originalActorIdSymbol]) {
 				throw new Error('actorid mismatch when updating object')
 			}
 
@@ -182,13 +188,19 @@ export async function handle(
 			await addObjectInOutbox(db, fromActor, obj, activity.published, target)
 
 			for (let i = 0, len = recipients.length; i < len; i++) {
+				const url = new URL(recipients[i])
+				if (url.hostname !== domain) {
+					console.warn('recipients is not for this instance')
+					continue
+				}
+
 				const handle = parseHandle(extractID(domain, recipients[i]))
 				if (handle.domain !== null && handle.domain !== domain) {
 					console.warn('activity not for current instance')
 					continue
 				}
 
-				const person = await actors.getPersonById(db, actorURL(domain, handle.localPart))
+				const person = await actors.getActorById(db, actorURL(domain, handle.localPart))
 				if (person === null) {
 					console.warn(`person ${recipients[i]} not found`)
 					continue
@@ -210,7 +222,7 @@ export async function handle(
 			requireComplexObject()
 			const actorId = getActorAsId()
 
-			const actor = await actors.getPersonById(db, activity.object.actor)
+			const actor = await actors.getActorById(db, activity.object.actor)
 			if (actor !== null) {
 				const follower = await actors.getAndCache(new URL(actorId), db)
 				await acceptFollowing(db, actor, follower)
@@ -226,7 +238,7 @@ export async function handle(
 			const objectId = getObjectAsId()
 			const actorId = getActorAsId()
 
-			const receiver = await actors.getPersonById(db, objectId)
+			const receiver = await actors.getActorById(db, objectId)
 			if (receiver !== null) {
 				const originalActor = await actors.getAndCache(new URL(actorId), db)
 				const receiverAcct = `${receiver.preferredUsername}@${domain}`
@@ -237,7 +249,7 @@ export async function handle(
 				await acceptFollowing(db, originalActor, receiver)
 				const reply = accept.create(receiver, activity)
 				const signingKey = await getSigningKey(userKEK, db, receiver)
-				await deliverToActor(signingKey, receiver, originalActor, reply)
+				await deliverToActor(signingKey, receiver, originalActor, reply, domain)
 
 				// Notify the user
 				const notifId = await insertFollowNotification(db, receiver, originalActor)
@@ -278,8 +290,14 @@ export async function handle(
 
 			const fromActor = await actors.getAndCache(actorId, db)
 
+			if (await hasReblog(db, fromActor, obj)) {
+				// A reblog already exists. To avoid dulicated reblog we ignore.
+				console.warn('probably duplicated Announce message')
+				break
+			}
+
 			// notify the user
-			const targetActor = await actors.getPersonById(db, new URL(obj.originalActorId))
+			const targetActor = await actors.getActorById(db, new URL(obj[originalActorIdSymbol]))
 			if (targetActor === null) {
 				console.warn('object actor not found')
 				break
@@ -288,15 +306,10 @@ export async function handle(
 			const notifId = await createNotification(db, 'reblog', targetActor, fromActor, obj)
 
 			await Promise.all([
-				// Add the object in the originating actor's outbox, allowing other
-				// actors on this instance to see the note in their timelines.
-				addObjectInOutbox(db, fromActor, obj, activity.published),
-
-				// Store the reblog for counting
-				insertReblog(db, fromActor, obj),
-
+				createReblog(db, fromActor, obj),
 				sendReblogNotification(db, fromActor, targetActor, notifId, adminEmail, vapidKeys),
 			])
+
 			break
 		}
 
@@ -306,13 +319,13 @@ export async function handle(
 			const objectId = getObjectAsId()
 
 			const obj = await objects.getObjectById(db, objectId)
-			if (obj === null || !obj.originalActorId) {
+			if (obj === null || !obj[originalActorIdSymbol]) {
 				console.warn('unknown object')
 				break
 			}
 
 			const fromActor = await actors.getAndCache(actorId, db)
-			const targetActor = await actors.getPersonById(db, new URL(obj.originalActorId))
+			const targetActor = await actors.getActorById(db, new URL(obj[originalActorIdSymbol]))
 			if (targetActor === null) {
 				console.warn('object actor not found')
 				break
@@ -329,6 +342,31 @@ export async function handle(
 			break
 		}
 
+		// https://www.w3.org/TR/activitystreams-vocabulary/#dfn-delete
+		case 'Delete': {
+			const objectId = getObjectAsId()
+			const actorId = getActorAsId()
+
+			const obj = await objects.getObjectByOriginalId(db, objectId)
+			if (obj === null || !obj[originalActorIdSymbol]) {
+				console.warn('unknown object or missing originalActorId')
+				break
+			}
+
+			if (actorId.toString() !== obj[originalActorIdSymbol]) {
+				console.warn(`authorized Delete (${actorId} vs ${obj[originalActorIdSymbol]})`)
+				return
+			}
+
+			if (!['Note'].includes(obj.type)) {
+				console.warn('unsupported Update for Object type: ' + activity.object.type)
+				return
+			}
+
+			await deleteObject(db, obj)
+			break
+		}
+
 		default:
 			console.warn(`Unsupported activity: ${activity.type}`)
 	}
@@ -336,11 +374,11 @@ export async function handle(
 
 async function cacheObject(
 	domain: string,
-	obj: Object,
+	obj: APObject,
 	db: D1Database,
 	originalActorId: URL,
 	originalObjectId: URL
-): Promise<{ created: boolean; object: Object } | null> {
+): Promise<{ created: boolean; object: APObject } | null> {
 	switch (obj.type) {
 		case 'Note': {
 			return objects.cacheObject(domain, db, obj, originalActorId, originalObjectId, false)

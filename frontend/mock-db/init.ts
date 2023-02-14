@@ -1,10 +1,11 @@
 import { createPerson, getPersonByEmail, type Person } from 'wildebeest/backend/src/activitypub/actors'
 import { replies, statuses } from 'wildebeest/frontend/src/dummyData'
 import type { Account, MastodonStatus } from 'wildebeest/frontend/src/types'
-import { createPublicNote, Note } from 'wildebeest/backend/src/activitypub/objects/note'
-import { addObjectInOutbox } from 'wildebeest/backend/src/activitypub/actors/outbox'
-import { insertReblog } from 'wildebeest/backend/src/mastodon/reblog'
-import { insertReply } from 'wildebeest/backend/src/mastodon/reply'
+import { Note } from 'wildebeest/backend/src/activitypub/objects/note'
+import { createReblog } from 'wildebeest/backend/src/mastodon/reblog'
+import { createReply as createReplyInBackend } from 'wildebeest/backend/test/shared.utils'
+import { createStatus } from 'wildebeest/backend/src/mastodon/status'
+import type { APObject } from 'wildebeest/backend/src/activitypub/objects'
 
 /**
  * Run helper commands to initialize the database with actors, statuses, etc.
@@ -13,33 +14,22 @@ export async function init(domain: string, db: D1Database) {
 	const loadedStatuses: { status: MastodonStatus; note: Note }[] = []
 	for (const status of statuses) {
 		const actor = await getOrCreatePerson(domain, db, status.account)
-		const note = await createStatus(domain, db, actor, status.content)
+		const note = await createStatus(
+			domain,
+			db,
+			actor,
+			status.content,
+			status.media_attachments as unknown as APObject[]
+		)
 		loadedStatuses.push({ status, note })
 	}
 
 	const { reblogger, noteToReblog } = await pickReblogDetails(loadedStatuses, domain, db)
-	reblogNote(db, reblogger, noteToReblog)
+	await createReblog(db, reblogger, noteToReblog)
 
 	for (const reply of replies) {
 		await createReply(domain, db, reply, loadedStatuses)
 	}
-}
-
-/**
- * Create a status object in the given actor's outbox.
- */
-async function createStatus(domain: string, db: D1Database, actor: Person, content: string) {
-	const note = await createPublicNote(domain, db, content, actor)
-	await addObjectInOutbox(db, actor, note)
-	return note
-}
-
-/**
- * Reblogs a note (representing a status)
- */
-async function reblogNote(db: D1Database, reblogger: Person, noteToReblog: Note) {
-	await addObjectInOutbox(db, reblogger, noteToReblog)
-	await insertReblog(db, reblogger, noteToReblog)
 }
 
 /**
@@ -58,14 +48,14 @@ async function createReply(
 
 	const originalStatus = loadedStatuses.find(({ status: { id } }) => id === reply.in_reply_to_id)
 	if (!originalStatus) {
-		console.warn(`Ignoring reply since no status matching the in_reply_to_id ${reply.id} has been found`)
+		console.warn(
+			`Ignoring reply with id ${reply.id} since no status matching the in_reply_to_id ${reply.in_reply_to_id} has been found`
+		)
 		return
 	}
 
-	const inReplyTo = originalStatus.note.mastodonId
 	const actor = await getOrCreatePerson(domain, db, reply.account)
-	const replyNote = await createPublicNote(domain, db, reply.content, actor, [], { inReplyTo })
-	await insertReply(db, actor, replyNote, originalStatus.note)
+	await createReplyInBackend(domain, db, actor, originalStatus.note, reply.content)
 }
 
 async function getOrCreatePerson(

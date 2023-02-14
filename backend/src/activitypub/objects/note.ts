@@ -1,6 +1,7 @@
 // https://www.w3.org/TR/activitystreams-vocabulary/#object-types
 
 import type { Actor } from 'wildebeest/backend/src/activitypub/actors'
+import type { Link } from 'wildebeest/backend/src/activitypub/objects/link'
 import { followersURL } from 'wildebeest/backend/src/activitypub/actors'
 import { PUBLIC_GROUP } from 'wildebeest/backend/src/activitypub/activities'
 import * as objects from '.'
@@ -8,16 +9,16 @@ import * as objects from '.'
 const NOTE = 'Note'
 
 // https://www.w3.org/TR/activitystreams-vocabulary/#dfn-note
-export interface Note extends objects.Object {
+export interface Note extends objects.APObject {
 	content: string
 	attributedTo?: string
 	summary?: string
 	inReplyTo?: string
 	replies?: string
 	to: Array<string>
-	attachment: Array<objects.Object>
-	cc?: Array<string>
-	tag?: Array<string>
+	attachment: Array<objects.APObject>
+	cc: Array<string>
+	tag: Array<Link>
 }
 
 export async function createPublicNote(
@@ -25,7 +26,7 @@ export async function createPublicNote(
 	db: D1Database,
 	content: string,
 	actor: Actor,
-	attachment: Array<objects.Object> = [],
+	attachments: Array<objects.APObject> = [],
 	extraProperties: any = {}
 ): Promise<Note> {
 	const actorId = new URL(actor.id)
@@ -41,8 +42,8 @@ export async function createPublicNote(
 		sensitive: false,
 		summary: null,
 		tag: [],
-		attachment,
 
+		attachment: attachments,
 		inReplyTo: null,
 		...extraProperties,
 	}
@@ -56,7 +57,7 @@ export async function createPrivateNote(
 	content: string,
 	actor: Actor,
 	targetActor: Actor,
-	attachment: Array<objects.Object> = [],
+	attachment: Array<objects.APObject> = [],
 	extraProperties: any = {}
 ): Promise<Note> {
 	const actorId = new URL(actor.id)

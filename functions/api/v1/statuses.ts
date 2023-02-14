@@ -1,20 +1,19 @@
 // https://docs.joinmastodon.org/methods/statuses/#create
 
+import type { Note } from 'wildebeest/backend/src/activitypub/objects/note'
 import { cors } from 'wildebeest/backend/src/utils/cors'
-import type { Object } from 'wildebeest/backend/src/activitypub/objects'
+import type { APObject } from 'wildebeest/backend/src/activitypub/objects'
 import { insertReply } from 'wildebeest/backend/src/mastodon/reply'
 import * as timeline from 'wildebeest/backend/src/mastodon/timeline'
 import type { Queue, DeliverMessageBody } from 'wildebeest/backend/src/types/queue'
-import { createPublicNote } from 'wildebeest/backend/src/activitypub/objects/note'
 import type { Document } from 'wildebeest/backend/src/activitypub/objects'
 import { getObjectByMastodonId } from 'wildebeest/backend/src/activitypub/objects'
-import { getMentions } from 'wildebeest/backend/src/mastodon/status'
+import { createStatus, getMentions } from 'wildebeest/backend/src/mastodon/status'
+import { getHashtags, insertHashtags } from 'wildebeest/backend/src/mastodon/hashtag'
 import * as activities from 'wildebeest/backend/src/activitypub/activities/create'
 import type { Env } from 'wildebeest/backend/src/types/env'
 import type { ContextData } from 'wildebeest/backend/src/types/context'
-import { queryAcct } from 'wildebeest/backend/src/webfinger'
 import { deliverFollowers, deliverToActor } from 'wildebeest/backend/src/activitypub/deliver'
-import { addObjectInOutbox } from 'wildebeest/backend/src/activitypub/actors/outbox'
 import type { Person } from 'wildebeest/backend/src/activitypub/actors'
 import { getSigningKey } from 'wildebeest/backend/src/mastodon/account'
 import { readBody } from 'wildebeest/backend/src/utils/body'
@@ -23,6 +22,10 @@ import type { Visibility } from 'wildebeest/backend/src/types'
 import { toMastodonStatusFromObject } from 'wildebeest/backend/src/mastodon/status'
 import type { Cache } from 'wildebeest/backend/src/cache'
 import { cacheFromEnv } from 'wildebeest/backend/src/cache'
+import { enrichStatus } from 'wildebeest/backend/src/mastodon/microformats'
+import * as idempotency from 'wildebeest/backend/src/mastodon/idempotency'
+import { newMention } from 'wildebeest/backend/src/activitypub/objects/mention'
+import { originalObjectIdSymbol } from 'wildebeest/backend/src/activitypub/objects'
 
 type StatusCreate = {
 	status: string
@@ -45,10 +48,24 @@ export async function handleRequest(
 	queue: Queue<DeliverMessageBody>,
 	cache: Cache
 ): Promise<Response> {
-	// TODO: implement Idempotency-Key
-
 	if (request.method !== 'POST') {
 		return new Response('', { status: 400 })
+	}
+
+	const domain = new URL(request.url).hostname
+	const headers = {
+		...cors(),
+		'content-type': 'application/json; charset=utf-8',
+	}
+
+	const idempotencyKey = request.headers.get('Idempotency-Key')
+
+	if (idempotencyKey !== null) {
+		const maybeObject = await idempotency.hasKey(db, idempotencyKey)
+		if (maybeObject !== null) {
+			const res = await toMastodonStatusFromObject(db, maybeObject as Note, domain)
+			return new Response(JSON.stringify(res), { headers })
+		}
 	}
 
 	const body = await readBody<StatusCreate>(request)
@@ -74,7 +91,7 @@ export async function handleRequest(
 		}
 	}
 
-	let inReplyToObject: Object | null = null
+	let inReplyToObject: APObject | null = null
 
 	if (body.in_reply_to_id) {
 		inReplyToObject = await getObjectByMastodonId(db, body.in_reply_to_id)
@@ -85,12 +102,22 @@ export async function handleRequest(
 
 	const extraProperties: any = {}
 	if (inReplyToObject !== null) {
-		extraProperties.inReplyTo = inReplyToObject.id.toString()
+		extraProperties.inReplyTo = inReplyToObject[originalObjectIdSymbol] || inReplyToObject.id.toString()
 	}
 
-	const domain = new URL(request.url).hostname
-	const note = await createPublicNote(domain, db, body.status, connectedActor, mediaAttachments, extraProperties)
-	await addObjectInOutbox(db, connectedActor, note)
+	const hashtags = getHashtags(body.status)
+
+	const content = enrichStatus(body.status)
+	const mentions = await getMentions(body.status, domain)
+	if (mentions.length > 0) {
+		extraProperties.tag = mentions.map(newMention)
+	}
+
+	const note = await createStatus(domain, db, connectedActor, content, mediaAttachments, extraProperties)
+
+	if (hashtags.length > 0) {
+		await insertHashtags(db, note, hashtags)
+	}
 
 	if (inReplyToObject !== null) {
 		// after the status has been created, record the reply.
@@ -102,31 +129,21 @@ export async function handleRequest(
 
 	{
 		// If the status is mentioning other persons, we need to delivery it to them.
-		const mentions = getMentions(body.status)
 		for (let i = 0, len = mentions.length; i < len; i++) {
-			if (mentions[i].domain === null) {
-				// Only deliver the note for remote actors
-				continue
-			}
-			const acct = `${mentions[i].localPart}@${mentions[i].domain}`
-			const targetActor = await queryAcct(mentions[i].domain!, acct)
-			if (targetActor === null) {
-				console.warn(`actor ${acct} not found`)
-				continue
-			}
-			note.to.push(targetActor.id.toString())
+			const targetActor = mentions[i]
+			note.cc.push(targetActor.id.toString())
 			const activity = activities.create(domain, connectedActor, note)
 			const signingKey = await getSigningKey(userKEK, db, connectedActor)
-			await deliverToActor(signingKey, connectedActor, targetActor, activity)
+			await deliverToActor(signingKey, connectedActor, targetActor, activity, domain)
 		}
+	}
+
+	if (idempotencyKey !== null) {
+		await idempotency.insertKey(db, idempotencyKey, note)
 	}
 
 	await timeline.pregenerateTimelines(domain, db, cache, connectedActor)
 
 	const res = await toMastodonStatusFromObject(db, note, domain)
-	const headers = {
-		...cors(),
-		'content-type': 'application/json; charset=utf-8',
-	}
 	return new Response(JSON.stringify(res), { headers })
 }

@@ -2,14 +2,18 @@ import { makeDB, isUrlValid } from './utils'
 import { MessageType } from 'wildebeest/backend/src/types/queue'
 import type { JWK } from 'wildebeest/backend/src/webpush/jwk'
 import { createPerson } from 'wildebeest/backend/src/activitypub/actors'
-import { createPublicNote, createPrivateNote } from 'wildebeest/backend/src/activitypub/objects/note'
+import * as actors from 'wildebeest/backend/src/activitypub/actors'
+import { createPrivateNote, createPublicNote } from 'wildebeest/backend/src/activitypub/objects/note'
 import { addObjectInOutbox } from 'wildebeest/backend/src/activitypub/actors/outbox'
 import { strict as assert } from 'node:assert/strict'
 import { cacheObject } from 'wildebeest/backend/src/activitypub/objects/'
+import * as ap_objects from 'wildebeest/functions/ap/o/[id]'
 import * as ap_users from 'wildebeest/functions/ap/users/[id]'
 import * as ap_outbox from 'wildebeest/functions/ap/users/[id]/outbox'
 import * as ap_inbox from 'wildebeest/functions/ap/users/[id]/inbox'
 import * as ap_outbox_page from 'wildebeest/functions/ap/users/[id]/outbox/page'
+import { createStatus } from '../src/mastodon/status'
+import { mastodonIdSymbol } from 'wildebeest/backend/src/activitypub/objects'
 
 const userKEK = 'test_kek5'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -55,8 +59,8 @@ describe('ActivityPub', () => {
 			const db = await makeDB()
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
-			await addObjectInOutbox(db, actor, await createPublicNote(domain, db, 'my first status', actor))
-			await addObjectInOutbox(db, actor, await createPublicNote(domain, db, 'my second status', actor))
+			await createStatus(domain, db, actor, 'my first status')
+			await createStatus(domain, db, actor, 'my second status')
 
 			const res = await ap_outbox.handleRequest(domain, db, 'sven', userKEK)
 			assert.equal(res.status, 200)
@@ -70,9 +74,9 @@ describe('ActivityPub', () => {
 			const db = await makeDB()
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
-			await addObjectInOutbox(db, actor, await createPublicNote(domain, db, 'my first status', actor))
+			await createStatus(domain, db, actor, 'my first status')
 			await sleep(10)
-			await addObjectInOutbox(db, actor, await createPublicNote(domain, db, 'my second status', actor))
+			await createStatus(domain, db, actor, 'my second status')
 
 			const res = await ap_outbox_page.handleRequest(domain, db, 'sven')
 			assert.equal(res.status, 200)
@@ -125,6 +129,88 @@ describe('ActivityPub', () => {
 		})
 	})
 
+	describe('Actors', () => {
+		test('getAndCache adds peer', async () => {
+			const actorId = new URL('https://example.com/user/foo')
+
+			globalThis.fetch = async (input: RequestInfo) => {
+				if (input.toString() === actorId.toString()) {
+					return new Response(
+						JSON.stringify({
+							id: actorId,
+							type: 'Person',
+							preferredUsername: 'sven',
+							name: 'sven ssss',
+
+							icon: { url: 'icon.jpg' },
+							image: { url: 'image.jpg' },
+						})
+					)
+				}
+
+				throw new Error(`unexpected request to "${input}"`)
+			}
+
+			const db = await makeDB()
+
+			await actors.getAndCache(actorId, db)
+
+			const { results } = (await db.prepare('SELECT domain from peers').all()) as any
+			assert.equal(results.length, 1)
+			assert.equal(results[0].domain, 'example.com')
+		})
+
+		test('getAndCache supports any Actor types', async () => {
+			// While Actor ObjectID MUST be globally unique, the Object can
+			// change type and Mastodon uses this behavior as a feature.
+			// We need to make sure our caching works with Actor that change
+			// types.
+
+			const actorId = new URL('https://example.com/user/foo')
+
+			globalThis.fetch = async (input: RequestInfo) => {
+				if (input.toString() === actorId.toString()) {
+					return new Response(
+						JSON.stringify({
+							id: actorId,
+							type: 'Service',
+							preferredUsername: 'sven',
+							name: 'sven ssss',
+
+							icon: { url: 'icon.jpg' },
+							image: { url: 'image.jpg' },
+						})
+					)
+				}
+
+				if (input.toString() === actorId.toString()) {
+					return new Response(
+						JSON.stringify({
+							id: actorId,
+							type: 'Person',
+							preferredUsername: 'sven',
+							name: 'sven ssss',
+
+							icon: { url: 'icon.jpg' },
+							image: { url: 'image.jpg' },
+						})
+					)
+				}
+
+				throw new Error(`unexpected request to "${input}"`)
+			}
+
+			const db = await makeDB()
+
+			await actors.getAndCache(actorId, db)
+
+			const { results } = (await db.prepare('SELECT * FROM actors').all()) as any
+			assert.equal(results.length, 1)
+			assert.equal(results[0].id, actorId.toString())
+			assert.equal(results[0].type, 'Service')
+		})
+	})
+
 	describe('Objects', () => {
 		test('cacheObject deduplicates object', async () => {
 			const db = await makeDB()
@@ -155,14 +241,48 @@ describe('ActivityPub', () => {
 			result = await db.prepare('SELECT count(*) as count from objects').first()
 			assert.equal(result.count, 1)
 		})
+
+		test('cacheObject adds peer', async () => {
+			const db = await makeDB()
+			const properties = { type: 'Note', a: 1, b: 2 }
+			const actor = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+			const originalObjectId = new URL('https://example.com/object1')
+
+			await cacheObject(domain, db, properties, actor.id, originalObjectId, false)
+
+			const { results } = (await db.prepare('SELECT domain from peers').all()) as any
+			assert.equal(results.length, 1)
+			assert.equal(results[0].domain, 'example.com')
+		})
+
+		test('serve unknown object', async () => {
+			const db = await makeDB()
+			const res = await ap_objects.handleRequest(domain, db, 'unknown id')
+			assert.equal(res.status, 404)
+		})
+
+		test('serve object', async () => {
+			const db = await makeDB()
+			const actor = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+			const note = await createPublicNote(domain, db, 'content', actor)
+
+			const res = await ap_objects.handleRequest(domain, db, note[mastodonIdSymbol]!)
+			assert.equal(res.status, 200)
+
+			const data = await res.json<any>()
+			assert.equal(data.content, 'content')
+		})
 	})
 
 	describe('Inbox', () => {
-		test('send Note to non existant user', async () => {
+		test('send Note to non existent user', async () => {
 			const db = await makeDB()
 
 			const queue = {
 				async send() {},
+				async sendBatch() {
+					throw new Error('unimplemented')
+				},
 			}
 
 			const activity: any = {}
@@ -179,6 +299,9 @@ describe('ActivityPub', () => {
 			const queue = {
 				async send(v: any) {
 					msg = v
+				},
+				async sendBatch() {
+					throw new Error('unimplemented')
 				},
 			}
 

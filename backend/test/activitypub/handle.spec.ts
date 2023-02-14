@@ -7,6 +7,7 @@ import { addFollowing } from 'wildebeest/backend/src/mastodon/follow'
 import * as activityHandler from 'wildebeest/backend/src/activitypub/activities/handle'
 import { createPerson } from 'wildebeest/backend/src/activitypub/actors'
 import { ObjectsRow } from 'wildebeest/backend/src/types/objects'
+import { originalObjectIdSymbol } from 'wildebeest/backend/src/activitypub/objects'
 
 const adminEmail = 'admin@example.com'
 const domain = 'cloudflare.com'
@@ -337,11 +338,11 @@ describe('ActivityPub', () => {
 
 				const obj: any = await getObjectById(db, entry.object_id)
 				assert(obj)
-				assert.equal(obj.originalObjectId, 'https://example.com/note2')
+				assert.equal(obj[originalObjectIdSymbol], 'https://example.com/note2')
 
 				const inReplyTo: any = await getObjectById(db, entry.in_reply_to_object_id)
 				assert(inReplyTo)
-				assert.equal(inReplyTo.originalObjectId, 'https://example.com/note1')
+				assert.equal(inReplyTo[originalObjectIdSymbol], 'https://example.com/note1')
 			})
 
 			test('preserve Note sent with `to`', async () => {
@@ -351,7 +352,7 @@ describe('ActivityPub', () => {
 				const activity = {
 					type: 'Create',
 					actor: actor.id.toString(),
-					to: ['some actor'],
+					to: ['https://example.com/some-actor'],
 					cc: [],
 					object: {
 						id: 'https://example.com/note1',
@@ -362,7 +363,7 @@ describe('ActivityPub', () => {
 				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
 
 				const row = await db.prepare('SELECT * FROM outbox_objects').first<{ target: string }>()
-				assert.equal(row.target, 'some actor')
+				assert.equal(row.target, 'https://example.com/some-actor')
 			})
 
 			test('Object props get sanitized', async () => {
@@ -543,6 +544,203 @@ describe('ActivityPub', () => {
 					.first<{ actor_id: string }>()
 				assert(outbox_object)
 				assert.equal(outbox_object.actor_id, remoteActorId)
+			})
+
+			test('duplicated announce', async () => {
+				const remoteActorId = 'https://example.com/actor'
+				const objectId = 'https://example.com/some-object'
+				globalThis.fetch = async (input: RequestInfo) => {
+					if (input.toString() === remoteActorId) {
+						return new Response(
+							JSON.stringify({
+								id: remoteActorId,
+								icon: { url: 'img.com' },
+								type: 'Person',
+							})
+						)
+					}
+
+					if (input.toString() === objectId) {
+						return new Response(
+							JSON.stringify({
+								id: objectId,
+								type: 'Note',
+								content: 'foo',
+							})
+						)
+					}
+
+					throw new Error('unexpected request to ' + input)
+				}
+
+				const db = await makeDB()
+				await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
+
+				const activity: any = {
+					type: 'Announce',
+					actor: remoteActorId,
+					to: [],
+					cc: [],
+					object: objectId,
+				}
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				// Handle the same Activity
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				// Ensure only one reblog is kept
+				const { count } = await db.prepare('SELECT count(*) as count FROM outbox_objects').first<{ count: number }>()
+				assert.equal(count, 1)
+			})
+		})
+
+		describe('Delete', () => {
+			test('delete Note', async () => {
+				const db = await makeDB()
+				const actorA = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+				const originalObjectId = 'https://example.com/note123'
+
+				await db
+					.prepare(
+						'INSERT INTO objects (id, type, properties, original_actor_id, original_object_id, local, mastodon_id) VALUES (?, ?, ?, ?, ?, 1, ?)'
+					)
+					.bind(
+						'https://example.com/object1',
+						'Note',
+						JSON.stringify({ content: 'my first status' }),
+						actorA.id.toString(),
+						originalObjectId,
+						'mastodonid1'
+					)
+					.run()
+
+				const activity: any = {
+					type: 'Delete',
+					actor: actorA.id,
+					to: [],
+					cc: [],
+					object: originalObjectId,
+				}
+
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				const { count } = await db.prepare('SELECT count(*) as count FROM objects').first<{ count: number }>()
+				assert.equal(count, 0)
+			})
+
+			test('delete Tombstone', async () => {
+				const db = await makeDB()
+				const actorA = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+				const originalObjectId = 'https://example.com/note456'
+
+				await db
+					.prepare(
+						'INSERT INTO objects (id, type, properties, original_actor_id, original_object_id, local, mastodon_id) VALUES (?, ?, ?, ?, ?, 1, ?)'
+					)
+					.bind(
+						'https://example.com/object1',
+						'Note',
+						JSON.stringify({ content: 'my first status' }),
+						actorA.id.toString(),
+						originalObjectId,
+						'mastodonid1'
+					)
+					.run()
+
+				const activity: any = {
+					type: 'Delete',
+					actor: actorA.id,
+					to: [],
+					cc: [],
+					object: {
+						type: 'Tombstone',
+						id: originalObjectId,
+					},
+				}
+
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				const { count } = await db.prepare('SELECT count(*) as count FROM objects').first<{ count: number }>()
+				assert.equal(count, 0)
+			})
+
+			test('reject Note deletion from another Actor', async () => {
+				const db = await makeDB()
+				const actorA = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+				const actorB = await createPerson(domain, db, userKEK, 'b@cloudflare.com')
+
+				const originalObjectId = 'https://example.com/note123'
+
+				// ActorB creates a Note
+				await db
+					.prepare(
+						'INSERT INTO objects (id, type, properties, original_actor_id, original_object_id, local, mastodon_id) VALUES (?, ?, ?, ?, ?, 1, ?)'
+					)
+					.bind(
+						'https://example.com/object1',
+						'Note',
+						JSON.stringify({ content: 'my first status' }),
+						actorB.id.toString(),
+						originalObjectId,
+						'mastodonid1'
+					)
+					.run()
+
+				const activity: any = {
+					type: 'Delete',
+					actor: actorA.id, // ActorA attempts to delete
+					to: [],
+					cc: [],
+					object: actorA.id,
+				}
+
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				// Ensure that we didn't actually delete the object
+				const { count } = await db.prepare('SELECT count(*) as count FROM objects').first<{ count: number }>()
+				assert.equal(count, 1)
+			})
+
+			test('ignore deletion of an Actor', async () => {
+				const db = await makeDB()
+				const actorA = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+
+				const activity: any = {
+					type: 'Delete',
+					actor: actorA.id,
+					to: [],
+					cc: [],
+					object: actorA.id,
+				}
+
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				// Ensure that we didn't actually delete the actor
+				const { count } = await db.prepare('SELECT count(*) as count FROM actors').first<{ count: number }>()
+				assert.equal(count, 1)
+			})
+
+			test('ignore deletion of a local Note', async () => {
+				// Deletion of local Note should only be done using Mastodon API
+				// (ie ActivityPub client-to-server).
+
+				const db = await makeDB()
+				const actorA = await createPerson(domain, db, userKEK, 'a@cloudflare.com')
+
+				const note = await createPublicNote(domain, db, 'my first status', actorA)
+
+				const activity: any = {
+					type: 'Delete',
+					actor: actorA.id,
+					to: [],
+					cc: [],
+					object: note.id,
+				}
+
+				await activityHandler.handle(domain, activity, db, userKEK, adminEmail, vapidKeys)
+
+				const { count } = await db.prepare('SELECT count(*) as count FROM objects').first<{ count: number }>()
+				assert.equal(count, 1)
 			})
 		})
 	})

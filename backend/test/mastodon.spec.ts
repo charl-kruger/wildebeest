@@ -11,6 +11,7 @@ import { makeDB, assertCORS, assertJSON, assertCache, createTestClient } from '.
 import { createPerson } from 'wildebeest/backend/src/activitypub/actors'
 import { createSubscription } from '../src/mastodon/subscription'
 import * as subscription from 'wildebeest/functions/api/v1/push/subscription'
+import { enrichStatus } from 'wildebeest/backend/src/mastodon/microformats'
 
 const userKEK = 'test_kek'
 const domain = 'cloudflare.com'
@@ -280,5 +281,70 @@ describe('Mastodon APIs', () => {
 
 		const data = await res.json<any>()
 		assert.equal(data.length, 0)
+	})
+
+	describe('Microformats', () => {
+		test('convert mentions to HTML', () => {
+			const mentionsToTest = [
+				{
+					mention: '@sven2@example.com',
+					expectedMentionSpan:
+						'<span class="h-card"><a href="https://example.com/@sven2" class="u-url mention">@<span>sven2</span></a></span>',
+				},
+				{
+					mention: '@test@example.eng.com',
+					expectedMentionSpan:
+						'<span class="h-card"><a href="https://example.eng.com/@test" class="u-url mention">@<span>test</span></a></span>',
+				},
+				{
+					mention: '@test.a.b.c-d@example.eng.co.uk',
+					expectedMentionSpan:
+						'<span class="h-card"><a href="https://example.eng.co.uk/@test.a.b.c-d" class="u-url mention">@<span>test.a.b.c-d</span></a></span>',
+				},
+				{
+					mention: '@testey@123456.abcdef',
+					expectedMentionSpan:
+						'<span class="h-card"><a href="https://123456.abcdef/@testey" class="u-url mention">@<span>testey</span></a></span>',
+				},
+				{
+					mention: '@testey@123456.test.testey.abcdef',
+					expectedMentionSpan:
+						'<span class="h-card"><a href="https://123456.test.testey.abcdef/@testey" class="u-url mention">@<span>testey</span></a></span>',
+				},
+			]
+			mentionsToTest.forEach(({ mention, expectedMentionSpan }) => {
+				assert.equal(enrichStatus(`hey ${mention} hi`), `<p>hey ${expectedMentionSpan} hi</p>`)
+				assert.equal(enrichStatus(`${mention} hi`), `<p>${expectedMentionSpan} hi</p>`)
+				assert.equal(enrichStatus(`${mention}\n\thein`), `<p>${expectedMentionSpan}\n\thein</p>`)
+				assert.equal(enrichStatus(`hey ${mention}`), `<p>hey ${expectedMentionSpan}</p>`)
+				assert.equal(enrichStatus(`${mention}`), `<p>${expectedMentionSpan}</p>`)
+				assert.equal(enrichStatus(`@!@£${mention}!!!`), `<p>@!@£${expectedMentionSpan}!!!</p>`)
+			})
+		})
+
+		test('handle invalid mention', () => {
+			assert.equal(enrichStatus('hey @#-...@example.com'), '<p>hey @#-...@example.com</p>')
+		})
+
+		test('convert links to HTML', () => {
+			const linksToTest = [
+				'https://cloudflare.com/abc',
+				'https://cloudflare.com/abc/def',
+				'https://www.cloudflare.com/123',
+				'http://www.cloudflare.co.uk',
+				'http://www.cloudflare.co.uk?test=test@123',
+				'http://www.cloudflare.com/.com/?test=test@~123&a=b',
+				'https://developers.cloudflare.com/workers/runtime-apis/request/#background',
+			]
+			linksToTest.forEach((link) => {
+				const url = new URL(link)
+				const urlDisplayText = `${url.hostname}${url.pathname}`
+				assert.equal(enrichStatus(`hey ${link} hi`), `<p>hey <a href="${link}">${urlDisplayText}</a> hi</p>`)
+				assert.equal(enrichStatus(`${link} hi`), `<p><a href="${link}">${urlDisplayText}</a> hi</p>`)
+				assert.equal(enrichStatus(`hey ${link}`), `<p>hey <a href="${link}">${urlDisplayText}</a></p>`)
+				assert.equal(enrichStatus(`${link}`), `<p><a href="${link}">${urlDisplayText}</a></p>`)
+				assert.equal(enrichStatus(`@!@£${link}!!!`), `<p>@!@£<a href="${link}">${urlDisplayText}</a>!!!</p>`)
+			})
+		})
 	})
 })

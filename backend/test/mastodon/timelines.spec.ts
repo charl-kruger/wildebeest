@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert/strict'
-import { insertReply } from 'wildebeest/backend/src/mastodon/reply'
+import { createReply } from 'wildebeest/backend/test/shared.utils'
 import { createImage } from 'wildebeest/backend/src/activitypub/objects/image'
 import { addFollowing, acceptFollowing } from 'wildebeest/backend/src/mastodon/follow'
 import { createPublicNote, createPrivateNote } from 'wildebeest/backend/src/activitypub/objects/note'
@@ -10,7 +10,9 @@ import * as timelines_home from 'wildebeest/functions/api/v1/timelines/home'
 import * as timelines_public from 'wildebeest/functions/api/v1/timelines/public'
 import * as timelines from 'wildebeest/backend/src/mastodon/timeline'
 import { insertLike } from 'wildebeest/backend/src/mastodon/like'
-import { insertReblog } from 'wildebeest/backend/src/mastodon/reblog'
+import { insertReblog, createReblog } from 'wildebeest/backend/src/mastodon/reblog'
+import { createStatus } from 'wildebeest/backend/src/mastodon/status'
+import { insertHashtags } from 'wildebeest/backend/src/mastodon/hashtag'
 
 const userKEK = 'test_kek6'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -29,12 +31,11 @@ describe('Mastodon APIs', () => {
 			await acceptFollowing(db, actor, actor2)
 
 			// Actor 2 is posting
-			const firstNoteFromActor2 = await createPublicNote(domain, db, 'first status from actor2', actor2)
-			await addObjectInOutbox(db, actor2, firstNoteFromActor2)
+			const firstNoteFromActor2 = await createStatus(domain, db, actor2, 'first status from actor2')
 			await sleep(10)
-			await addObjectInOutbox(db, actor2, await createPublicNote(domain, db, 'second status from actor2', actor2))
+			await createStatus(domain, db, actor2, 'second status from actor2')
 			await sleep(10)
-			await addObjectInOutbox(db, actor3, await createPublicNote(domain, db, 'first status from actor3', actor3))
+			await createStatus(domain, db, actor3, 'first status from actor3')
 			await sleep(10)
 
 			await insertLike(db, actor, firstNoteFromActor2)
@@ -74,6 +75,25 @@ describe('Mastodon APIs', () => {
 			assert.equal(data.length, 0)
 		})
 
+		test("home returns Notes sent to Actor's followers", async () => {
+			const db = await makeDB()
+			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
+			const actor2 = await createPerson(domain, db, userKEK, 'sven2@cloudflare.com')
+
+			// Actor is following actor2
+			await addFollowing(db, actor, actor2, 'not needed')
+			await acceptFollowing(db, actor, actor2)
+
+			// Actor 2 is posting
+			const note = await createPublicNote(domain, db, 'test post', actor2)
+			await addObjectInOutbox(db, actor2, note, undefined, actor2.followers.toString())
+
+			// Actor should only see posts from actor2 in the timeline
+			const data = await timelines.getHomeTimeline(domain, db, actor)
+			assert.equal(data.length, 1)
+			assert.equal(data[0].content, 'test post')
+		})
+
 		test("public doesn't show private Notes", async () => {
 			const db = await makeDB()
 			const actor1 = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
@@ -92,7 +112,7 @@ describe('Mastodon APIs', () => {
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
 			// Actor is posting
-			await addObjectInOutbox(db, actor, await createPublicNote(domain, db, 'status from myself', actor))
+			await createStatus(domain, db, actor, 'status from myself')
 
 			// Actor should only see posts from actor2 in the timeline
 			const connectedActor = actor
@@ -130,10 +150,9 @@ describe('Mastodon APIs', () => {
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 			const actor2 = await createPerson(domain, db, userKEK, 'sven2@cloudflare.com')
 
-			const statusFromActor = await createPublicNote(domain, db, 'status from actor', actor)
-			await addObjectInOutbox(db, actor, statusFromActor)
+			const statusFromActor = await createStatus(domain, db, actor, 'status from actor')
 			await sleep(10)
-			await addObjectInOutbox(db, actor2, await createPublicNote(domain, db, 'status from actor2', actor2))
+			await createStatus(domain, db, actor2, 'status from actor2')
 
 			await insertLike(db, actor, statusFromActor)
 			await insertReblog(db, actor, statusFromActor)
@@ -172,8 +191,7 @@ describe('Mastodon APIs', () => {
 
 			const properties = { url: 'https://example.com/image.jpg' }
 			const mediaAttachments = [await createImage(domain, db, actor, properties)]
-			const note = await createPublicNote(domain, db, 'status from actor', actor, mediaAttachments)
-			await addObjectInOutbox(db, actor, note)
+			await createStatus(domain, db, actor, 'status from actor', mediaAttachments)
 
 			const res = await timelines_public.handleRequest(domain, db)
 			assert.equal(res.status, 200)
@@ -209,16 +227,11 @@ describe('Mastodon APIs', () => {
 			const db = await makeDB()
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
-			const note = await createPublicNote(domain, db, 'a post', actor)
-			await addObjectInOutbox(db, actor, note)
+			const note = await createStatus(domain, db, actor, 'a post')
+
 			await sleep(10)
 
-			const inReplyTo = note.id
-			const reply = await createPublicNote(domain, db, 'a reply', actor, [], { inReplyTo })
-			await addObjectInOutbox(db, actor, reply)
-			await sleep(10)
-
-			await insertReply(db, actor, reply, note)
+			await createReply(domain, db, actor, note, 'a reply')
 
 			const connectedActor: any = actor
 
@@ -241,8 +254,7 @@ describe('Mastodon APIs', () => {
 			const db = await makeDB()
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
-			const note = await createPublicNote(domain, db, 'a post', actor)
-			await addObjectInOutbox(db, actor, note)
+			const note = await createStatus(domain, db, actor, 'a post')
 			await insertReblog(db, actor, note)
 
 			const connectedActor: any = actor
@@ -256,8 +268,7 @@ describe('Mastodon APIs', () => {
 			const db = await makeDB()
 			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
 
-			const note = await createPublicNote(domain, db, 'a post', actor)
-			await addObjectInOutbox(db, actor, note)
+			const note = await createStatus(domain, db, actor, 'a post')
 			await insertLike(db, actor, note)
 
 			const connectedActor: any = actor
@@ -265,6 +276,65 @@ describe('Mastodon APIs', () => {
 			const data = await timelines.getHomeTimeline(domain, db, connectedActor)
 			assert.equal(data.length, 1)
 			assert.equal(data[0].favourited, true)
+		})
+
+		test('show unique Notes', async () => {
+			const db = await makeDB()
+			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
+			const actorA = await createPerson(domain, db, userKEK, 'svenA@cloudflare.com')
+			const actorB = await createPerson(domain, db, userKEK, 'svenB@cloudflare.com')
+
+			// Actor posts
+			const note = await createStatus(domain, db, actor, 'a post')
+
+			// ActorA and B reblog the post
+			await createReblog(db, actorA, note)
+			await createReblog(db, actorB, note)
+
+			const data = await timelines.getPublicTimeline(domain, db, timelines.LocalPreference.NotSet)
+			assert.equal(data.length, 1)
+			assert.equal(data[0].content, 'a post')
+		})
+
+		test('timeline with non exitent tag', async () => {
+			const db = await makeDB()
+
+			const data = await timelines.getPublicTimeline(
+				domain,
+				db,
+				timelines.LocalPreference.NotSet,
+				0,
+				'non-existent-tag'
+			)
+			assert.equal(data.length, 0)
+		})
+
+		test('timeline tag', async () => {
+			const db = await makeDB()
+			const actor = await createPerson(domain, db, userKEK, 'sven@cloudflare.com')
+
+			{
+				const note = await createStatus(domain, db, actor, 'test 1')
+				await insertHashtags(db, note, ['test', 'a'])
+			}
+			await sleep(10)
+			{
+				const note = await createStatus(domain, db, actor, 'test 2')
+				await insertHashtags(db, note, ['test', 'b'])
+			}
+
+			{
+				const data = await timelines.getPublicTimeline(domain, db, timelines.LocalPreference.NotSet, 0, 'test')
+				assert.equal(data.length, 2)
+				assert.equal(data[0].content, 'test 2')
+				assert.equal(data[1].content, 'test 1')
+			}
+
+			{
+				const data = await timelines.getPublicTimeline(domain, db, timelines.LocalPreference.NotSet, 0, 'a')
+				assert.equal(data.length, 1)
+				assert.equal(data[0].content, 'test 1')
+			}
 		})
 	})
 })
